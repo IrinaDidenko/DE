@@ -1,0 +1,413 @@
+import pandas as pd
+import pyarrow.parquet as pq
+from sqlalchemy import create_engine, text, inspect
+import traceback
+import re
+from typing import Optional
+
+def create_table_from_parquet_pyarrow(
+    parquet_path: str,
+    table_name: str,
+    connection_string: str,
+    schema: Optional[str] = None,
+    chunk_size: int = 50000,
+    drop_existing: bool = True
+) -> int:
+    """
+    Создает таблицу в Oracle на основе структуры Parquet файла
+    и загружает данные с использованием PyArrow для работы с большими файлами
+    
+    Parameters:
+    -----------
+    parquet_path : str
+        Путь к Parquet файлу
+    table_name : str
+        Имя таблицы в Oracle
+    connection_string : str
+        Строка подключения к Oracle
+    schema : str, optional
+        Схема Oracle (если не указано, используется схема по умолчанию)
+    chunk_size : int, default=50000
+        Размер чанка для загрузки данных
+    drop_existing : bool, default=True
+        Удалять ли существующую таблицу
+    
+    Returns:
+    --------
+    int : Количество загруженных строк
+    """
+    engine = None
+    total_rows_loaded = 0
+    
+    try:
+        print("=" * 70)
+        print(f"ЗАГРУЗКА PARQUET В ORACLE")
+        print(f"Файл: {parquet_path}")
+        print(f"Таблица: {table_name}")
+        print("=" * 70)
+        
+        # ====================================================
+        # 1. ПОДКЛЮЧЕНИЕ К ORACLE
+        # ====================================================
+        print("\n1. Подключение к Oracle...")
+        engine = create_engine(connection_string, echo=False)
+        
+        # Проверка подключения
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 'CONNECTED' FROM dual"))
+            print(f"✓ Подключение успешно: {result.scalar()}")
+        
+        # ====================================================
+        # 2. АНАЛИЗ PARQUET ФАЙЛА С ПОМОЩЬЮ PYARROW
+        # ====================================================
+        print("\n2. Анализ структуры Parquet файла...")
+        
+        # Открываем Parquet файл с помощью PyArrow
+        parquet_file = pq.ParquetFile(parquet_path)
+        metadata = parquet_file.metadata
+        
+        # Получаем информацию о файле
+        total_rows = metadata.num_rows
+        num_row_groups = parquet_file.num_row_groups
+        schema_arrow = parquet_file.schema
+        
+        print(f"✓ Размер файла: {metadata.serialized_size / 1024 / 1024:.2f} MB")
+        print(f"✓ Количество строк: {total_rows:,}")
+        print(f"✓ Количество row groups: {num_row_groups}")
+        print(f"✓ Количество столбцов: {len(schema_arrow.names)}")
+        
+        # ====================================================
+        # 3. ЧТЕНИЕ ПЕРВОГО CHUNK ДЛЯ ОПРЕДЕЛЕНИЯ СТРУКТУРЫ
+        # ====================================================
+        print("\n3. Определение структуры данных...")
+        
+        # Читаем первый row group для анализа структуры
+        first_chunk = parquet_file.read_row_group(0) if num_row_groups > 0 else parquet_file.read()
+        df_sample = first_chunk.to_pandas()
+        
+        # Функция для очистки имен столбцов
+        def clean_column_name(col_name: str) -> str:
+            """Очищает имя столбца для Oracle"""
+            # Конвертируем в строку
+            col_name = str(col_name)
+            
+            # Заменяем недопустимые символы
+            clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', col_name)
+            
+            # Убираем множественные подчеркивания
+            clean_name = re.sub(r'_+', '_', clean_name)
+            
+            # Убираем подчеркивания по краям
+            clean_name = clean_name.strip('_')
+            
+            # Если пустое имя
+            if not clean_name:
+                clean_name = 'COLUMN_' + str(hash(col_name))[:8]
+            
+            # Если начинается с цифры
+            if clean_name and clean_name[0].isdigit():
+                clean_name = 'COL_' + clean_name
+            
+            # Oracle обычно использует верхний регистр
+            return clean_name.upper()
+        
+        # Функция для определения типа Oracle на основе PyArrow типа
+        def get_oracle_type_from_pyarrow(field) -> str:
+            """Определяет тип Oracle на основе PyArrow типа"""
+            field_type = str(field.type)
+            
+            # Словарь маппинга типов PyArrow -> Oracle
+            type_mapping = {
+                'int8': 'NUMBER(3)',
+                'int16': 'NUMBER(5)',
+                'int32': 'NUMBER(10)',
+                'int64': 'NUMBER(19)',
+                'uint8': 'NUMBER(3)',
+                'uint16': 'NUMBER(5)',
+                'uint32': 'NUMBER(10)',
+                'uint64': 'NUMBER(19)',
+                'float': 'FLOAT',
+                'double': 'FLOAT',
+                'bool': 'CHAR(1)',
+                'string': 'VARCHAR2(4000)',
+                'binary': 'BLOB',
+                'date32': 'DATE',
+                'date64': 'DATE',
+                'timestamp[ns]': 'TIMESTAMP',
+                'timestamp[us]': 'TIMESTAMP',
+                'timestamp[ms]': 'TIMESTAMP',
+                'timestamp[s]': 'TIMESTAMP',
+                'decimal': 'NUMBER'
+            }
+            
+            for pyarrow_type, oracle_type in type_mapping.items():
+                if pyarrow_type in field_type.lower():
+                    return oracle_type
+            
+            # Для неизвестных типов используем VARCHAR2
+            return 'VARCHAR2(4000)'
+        
+        # ====================================================
+        # 4. ГЕНЕРАЦИЯ DDL ДЛЯ СОЗДАНИЯ ТАБЛИЦЫ
+        # ====================================================
+        print("\n4. Генерация DDL для создания таблицы...")
+        
+        # Маппинг оригинальных имен в очищенные
+        column_mapping = {}
+        ddl_columns = []
+        
+        # Используем схему PyArrow для определения типов
+        for i, field in enumerate(schema_arrow):
+            original_name = field.name
+            clean_name = clean_column_name(original_name)
+            column_mapping[original_name] = clean_name
+            
+            # Определяем тип Oracle
+            oracle_type = get_oracle_type_from_pyarrow(field)
+            
+            # Для строковых типов уточняем длину на основе данных
+            if 'VARCHAR2' in oracle_type and i < len(df_sample.columns):
+                # Анализируем фактические данные для определения длины
+                col_data = df_sample.iloc[:, i]
+                if col_data.dtype == 'object':
+                    max_len = col_data.astype(str).str.len().max()
+                    if pd.notna(max_len):
+                        actual_len = int(max_len * 1.5)  # Запас 50%
+                        oracle_type = f'VARCHAR2({min(actual_len, 4000)})'
+            
+            ddl_columns.append(f'"{clean_name}" {oracle_type}')
+            print(f"  {original_name} → {clean_name} : {oracle_type}")
+        
+        # ====================================================
+        # 5. СОЗДАНИЕ ТАБЛИЦЫ В ORACLE
+        # ====================================================
+        print(f"\n5. Создание таблицы {table_name}...")
+        
+        # Формируем полное имя таблицы
+        full_table_name = f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
+        
+        with engine.begin() as conn:
+            # Удаляем существующую таблицу если нужно
+            if drop_existing:
+                try:
+                    drop_sql = f"""
+                    BEGIN
+                        EXECUTE IMMEDIATE 'DROP TABLE {full_table_name} PURGE';
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            NULL;
+                    END;
+                    """
+                    conn.execute(text(drop_sql))
+                    print(f"✓ Старая таблица удалена (если существовала)")
+                except Exception as drop_err:
+                    print(f"ℹ Не удалось удалить таблицу: {drop_err}")
+            
+            # Создаем новую таблицу
+            create_sql = f"""
+            CREATE TABLE {full_table_name} (
+                {', '.join(ddl_columns)}
+            )
+            """
+            
+            conn.execute(text(create_sql))
+            print(f"✓ Таблица {full_table_name} создана")
+        
+        # ====================================================
+        # 6. ЗАГРУЗКА ДАННЫХ С ИСПОЛЬЗОВАНИЕМ PYARROW
+        # ====================================================
+        print(f"\n6. Загрузка данных (размер чанка: {chunk_size} строк)...")
+        
+        total_rows_loaded = 0
+        start_time = pd.Timestamp.now()
+        
+        # Вариант A: Если файл уже разбит на row groups
+        if num_row_groups > 1:
+            print(f"Используем существующие {num_row_groups} row groups...")
+            
+            for rg_idx in range(num_row_groups):
+                try:
+                    # Читаем row group
+                    table_chunk = parquet_file.read_row_group(rg_idx)
+                    df_chunk = table_chunk.to_pandas()
+                    
+                    # Переименовываем столбцы
+                    df_chunk.rename(columns=column_mapping, inplace=True)
+                    
+                    # Загружаем в Oracle
+                    rows_loaded = df_chunk.to_sql(
+                        name=table_name,
+                        schema=schema,
+                        con=engine,
+                        if_exists='append',
+                        index=False,
+                        chunksize=10000,
+                        method='multi'
+                    )
+                    
+                    total_rows_loaded += rows_loaded
+                    progress = (total_rows_loaded / total_rows) * 100
+                    
+                    print(f"  Row group {rg_idx + 1}/{num_row_groups}: "
+                          f"{rows_loaded:,} строк, всего {total_rows_loaded:,} ({progress:.1f}%)")
+                    
+                except Exception as chunk_error:
+                    print(f"  ✗ Ошибка в row group {rg_idx + 1}: {chunk_error}")
+                    continue
+        
+        # Вариант B: Если один большой row group, разбиваем вручную
+        else:
+            print("Читаем и разбиваем файл на чанки...")
+            
+            # Читаем весь файл в PyArrow Table
+            full_table = parquet_file.read()
+            rows_per_chunk = chunk_size
+            
+            # Определяем количество чанков
+            num_chunks = (total_rows + rows_per_chunk - 1) // rows_per_chunk
+            
+            for chunk_idx in range(num_chunks):
+                start_row = chunk_idx * rows_per_chunk
+                end_row = min(start_row + rows_per_chunk, total_rows)
+                
+                try:
+                    # Извлекаем чанк из таблицы
+                    table_chunk = full_table.slice(start_row, rows_per_chunk)
+                    df_chunk = table_chunk.to_pandas()
+                    
+                    # Переименовываем столбцы
+                    df_chunk.rename(columns=column_mapping, inplace=True)
+                    
+                    # Загружаем в Oracle
+                    rows_loaded = df_chunk.to_sql(
+                        name=table_name,
+                        schema=schema,
+                        con=engine,
+                        if_exists='append',
+                        index=False,
+                        chunksize=10000,
+                        method='multi'
+                    )
+                    
+                    total_rows_loaded += rows_loaded
+                    progress = (total_rows_loaded / total_rows) * 100
+                    
+                    print(f"  Чанк {chunk_idx + 1}/{num_chunks}: строки {start_row:,}-{end_row:,}, "
+                          f"загружено {rows_loaded:,}, всего {total_rows_loaded:,} ({progress:.1f}%)")
+                    
+                except Exception as chunk_error:
+                    print(f"  ✗ Ошибка в чанке {chunk_idx + 1}: {chunk_error}")
+                    continue
+        
+        # ====================================================
+        # 7. ПРОВЕРКА И ЗАВЕРШЕНИЕ
+        # ====================================================
+        print("\n7. Проверка результатов...")
+        
+        elapsed_time = (pd.Timestamp.now() - start_time).total_seconds()
+        
+        with engine.connect() as conn:
+            # Проверяем количество строк в таблице
+            count_sql = f'SELECT COUNT(*) FROM {full_table_name}'
+            result = conn.execute(text(count_sql))
+            final_count = result.scalar()
+            
+            # Проверяем структуру таблицы
+            cols_sql = f"""
+            SELECT column_name, data_type, data_length, nullable
+            FROM all_tab_columns 
+            WHERE table_name = UPPER('{table_name}')
+            {'AND owner = UPPER(\'' + schema + '\')' if schema else ''}
+            ORDER BY column_id
+            """
+            
+            result = conn.execute(text(cols_sql))
+            table_columns = result.fetchall()
+            
+            print(f"\nСтруктура таблицы {full_table_name}:")
+            print("-" * 60)
+            print(f"{'Столбец':<30} {'Тип':<20} {'NULL':<10}")
+            print("-" * 60)
+            for col in table_columns:
+                print(f"{col[0]:<30} {col[1]:<20} {'YES' if col[3] == 'Y' else 'NO':<10}")
+        
+        print("\n" + "=" * 70)
+        print("ИТОГИ ЗАГРУЗКИ:")
+        print("=" * 70)
+        print(f"Исходный файл: {total_rows:,} строк")
+        print(f"Загружено в Oracle: {final_count:,} строк")
+        print(f"Время выполнения: {elapsed_time:.2f} секунд")
+        
+        if elapsed_time > 0:
+            speed = total_rows_loaded / elapsed_time
+            print(f"Скорость загрузки: {speed:.0f} строк/сек")
+        
+        if total_rows > 0:
+            success_rate = (final_count / total_rows) * 100
+            print(f"Процент успешной загрузки: {success_rate:.1f}%")
+        
+        print("=" * 70)
+        
+        return total_rows_loaded
+        
+    except Exception as e:
+        print(f"\n✗ КРИТИЧЕСКАЯ ОШИБКА: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return total_rows_loaded
+    
+    finally:
+        if engine:
+            engine.dispose()
+            print("✓ Соединение с Oracle закрыто")
+
+# ====================================================
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ТЕСТИРОВАНИЯ
+# ====================================================
+
+def test_parquet_loader():
+    """Тестовая функция для проверки загрузчика"""
+    
+    # Конфигурация подключения
+    CONFIG = {
+        'parquet_path': 'путь/к/вашему/файлу.parquet',
+        'table_name': 'TEST_PARQUET_DATA',
+        'connection_string': 'oracle+cx_oracle://user:password@host:1521/service_name',
+        'schema': None,  # или 'MY_SCHEMA'
+        'chunk_size': 50000,
+        'drop_existing': True
+    }
+    
+    print("Тестирование загрузки Parquet в Oracle...")
+    print(f"Используется PyArrow версии: {pq.__version__}")
+    print(f"Используется pandas версии: {pd.__version__}")
+    
+    # Запуск загрузки
+    result = create_table_from_parquet_pyarrow(**CONFIG)
+    
+    if result > 0:
+        print(f"\n✅ Загрузка успешно завершена! Загружено {result:,} строк.")
+    else:
+        print(f"\n❌ Загрузка завершилась с ошибкой или файл пуст.")
+
+# ====================================================
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ
+# ====================================================
+
+if __name__ == "__main__":
+    # Пример 1: Простая загрузка
+    rows_loaded = create_table_from_parquet_pyarrow(
+        parquet_path='sales_data.parquet',
+        table_name='SALES_IMPORT',
+        connection_string='oracle+cx_oracle://sales:sales123@db-server:1521/pdb_sales',
+        chunk_size=100000
+    )
+    
+    # Пример 2: Загрузка в конкретную схему
+    rows_loaded = create_table_from_parquet_pyarrow(
+        parquet_path='users.parquet',
+        table_name='USERS',
+        connection_string='oracle+cx_oracle://admin:admin123@localhost:1521/orclpdb1',
+        schema='APP_DATA',
+        chunk_size=50000,
+        drop_existing=True
+    )
