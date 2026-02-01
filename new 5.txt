@@ -1,0 +1,26 @@
+def fill_missing_regions_vectorized(df, result_df):
+    """
+    Векторизованная версия - самая быстрая
+    """
+    # Создаем копию
+    df_filled = df.copy()
+    
+    # Создаем Series для маппинга из result_df
+    # Приводим INN к строковому типу для надежности
+    mapping_series = result_df.set_index(result_df['index'].astype(str))['region_number']
+    
+    # Определяем индексы строк с отсутствующими регионами
+    missing_mask = df_filled['REGION_NUMBER'].isna() | (df_filled['REGION_NUMBER'].astype(str).str.strip() == '')
+    
+    # Для строк с отсутствующими регионами
+    if missing_mask.any():
+        # Преобразуем INN в строки для маппинга
+        df_filled.loc[missing_mask, 'INN_str'] = df_filled.loc[missing_mask, 'INN'].astype(str)
+        
+        # Заполняем пропущенные значения
+        df_filled.loc[missing_mask, 'REGION_NUMBER'] = df_filled.loc[missing_mask, 'INN_str'].map(mapping_series)
+        
+        # Удаляем временную колонку
+        df_filled = df_filled.drop(columns=['INN_str'])
+    
+    return df_filled
